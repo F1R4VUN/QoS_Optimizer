@@ -67,6 +67,12 @@ LLQ_MAX_PERCENT = 33.0
 # class-default / scavenger icin onerilen minimum pay
 CLASS_DEFAULT_MIN_PERCENT = 25.0
 
+# IOS'ta interface altindaki "max-reserved-bandwidth" komutu, CBWFQ+LLQ'nun
+# rezerve edebilecegi toplam payi sinirlar. Default %75'tir; kalan %25 kontrol
+# duzlemi (routing protokolleri, L2 keepalive) icin ayrilir. Toplam bu siniri
+# asarsa policy interface'e HIC uygulanmaz.
+IOS_DEFAULT_MAX_RESERVED = 75.0
+
 # IOS'ta "bandwidth percent" / "priority percent" parser araligi 1-100'dur;
 # 0 kabul edilmez. Asagidaki iki sabit uretilen config'i bu araliga zorlar.
 IOS_MIN_PERCENT = 1
@@ -107,6 +113,8 @@ class QoSPlan:
     voice_kbps: float
     video_kbps: float
     critical_kbps: float
+    # Interface altinda "max-reserved-bandwidth" degistirilmisse buraya yaz.
+    max_reserved_percent: float = IOS_DEFAULT_MAX_RESERVED
 
     def raw_percent(self, kbps: float) -> float:
         """Rapor icin yuvarlanmamis yuzde -- IOS donusumu bu deger uzerinden yapilir."""
@@ -123,6 +131,35 @@ class QoSPlan:
     @property
     def critical_percent(self) -> float:
         return round(self.raw_percent(self.critical_kbps), 1)
+
+    def ios_percents(self) -> dict[str, int]:
+        """Policy-map'e yazilacak tam sayi paylari (class adi -> yuzde)."""
+        return {
+            "VOICE": to_ios_percent(self.raw_percent(self.voice_kbps)),
+            "VIDEO": to_ios_percent(self.raw_percent(self.video_kbps)),
+            "CRITICAL-DATA": to_ios_percent(self.raw_percent(self.critical_kbps)),
+        }
+
+    @property
+    def reserved_percent(self) -> int:
+        """IOS'un max-reserved-bandwidth'e karsi saydigi toplam.
+
+        Bilerek ham yuzdeler degil, policy-map'e YAZILAN tam sayilar toplanir --
+        IOS de config'deki degerlere bakar. Yuvarlama ve trafigi olmayan
+        class'lar icin uygulanan %1 alt siniri bu toplami ham degerin uzerine
+        cikarabilir, ki asilma tam olarak orada yasanir.
+        """
+        return sum(self.ios_percents().values())
+
+    @property
+    def idle_classes(self) -> list[str]:
+        """Trafigi olmadigi halde policy-map'te %1 tutan class'lar."""
+        traffic = {
+            "VOICE": self.voice_kbps,
+            "VIDEO": self.video_kbps,
+            "CRITICAL-DATA": self.critical_kbps,
+        }
+        return [name for name, kbps in traffic.items() if kbps <= 0]
 
     @property
     def class_default_percent(self) -> float:
@@ -143,6 +180,24 @@ class QoSPlan:
                 f"minimum %{CLASS_DEFAULT_MIN_PERCENT}'in altinda. Best-effort/"
                 f"scavenger trafik tamamen aclikta kalabilir."
             )
+        if self.reserved_percent > self.max_reserved_percent:
+            msg = (
+                f"Policy-map toplam rezervasyonu %{self.reserved_percent} -- interface "
+                f"altindaki max-reserved-bandwidth siniri %{self.max_reserved_percent:g}'i "
+                f"asiyor. Bu bir performans uyarisi DEGIL: IOS policy'yi 'service-policy "
+                f"output' ile uygularken 'requested bandwidth ... available only ...' "
+                f"hatasi verip reddeder. Ya sinif paylarini dusur ya da interface altinda "
+                f"'max-reserved-bandwidth 100' kullan (o durumda kontrol duzlemi/L2 "
+                f"keepalive icin payi kendin birakmalisin)."
+            )
+            idle = self.idle_classes
+            if idle:
+                msg += (
+                    f" Not: trafigi olmayan {', '.join(idle)} class(lar)i, IOS %0'i kabul "
+                    f"etmedigi icin %1 ile yaziliyor ve bu toplama dahil."
+                )
+            msgs.append(msg)
+
         if self.class_default_percent < 0:
             msgs.append(
                 "TOPLAM %100'U ASIYOR -- bu plan link kapasitesinin uzerinde talep "
@@ -157,6 +212,8 @@ class QoSPlan:
             f"VIDEO (CBWFQ)           : {self.video_kbps:.1f} kbps  (%{self.video_percent})",
             f"CRITICAL-DATA (CBWFQ)   : {self.critical_kbps:.1f} kbps  (%{self.critical_percent})",
             f"class-default (kalan)   : %{self.class_default_percent}",
+            f"Policy-map rezervasyonu : %{self.reserved_percent}"
+            f"  (max-reserved-bandwidth %{self.max_reserved_percent:g})",
         ]
         warn = self.warnings()
         if warn:
@@ -174,15 +231,16 @@ class QoSPlan:
         gectigi icin hicbir satir "percent 0" uretmez (IOS bunu reddeder);
         karsiligi olmayan bir class en dusuk deger olan 1 ile yazilir.
         """
+        pct = self.ios_percents()
         return (
             f"policy-map {name}\n"
             f" class VOICE\n"
-            f"  priority percent {to_ios_percent(self.raw_percent(self.voice_kbps))}\n"
+            f"  priority percent {pct['VOICE']}\n"
             f" class VIDEO\n"
-            f"  bandwidth percent {to_ios_percent(self.raw_percent(self.video_kbps))}\n"
+            f"  bandwidth percent {pct['VIDEO']}\n"
             f"  random-detect dscp-based\n"
             f" class CRITICAL-DATA\n"
-            f"  bandwidth percent {to_ios_percent(self.raw_percent(self.critical_kbps))}\n"
+            f"  bandwidth percent {pct['CRITICAL-DATA']}\n"
             f"  random-detect dscp-based\n"
             f" class class-default\n"
             f"  fair-queue\n"
@@ -199,6 +257,7 @@ def build_plan(
     video_sessions: int,
     critical_kbps: float,
     compressed_rtp: bool = False,
+    max_reserved_percent: float = IOS_DEFAULT_MAX_RESERVED,
 ) -> QoSPlan:
     call_kbps = per_call_kbps(codec_key, l2_type, compressed_rtp)
     voice_total = call_kbps * concurrent_calls
@@ -209,6 +268,7 @@ def build_plan(
         voice_kbps=voice_total,
         video_kbps=video_total,
         critical_kbps=critical_kbps,
+        max_reserved_percent=max_reserved_percent,
     )
 
 
@@ -225,6 +285,15 @@ def main():
     parser.add_argument("--video-sessions", type=int, default=0)
     parser.add_argument("--critical-kbps", type=float, default=0)
     parser.add_argument("--policy-name", default="WAN-EDGE-QOS")
+    parser.add_argument(
+        "--max-reserved-bandwidth",
+        type=float,
+        default=IOS_DEFAULT_MAX_RESERVED,
+        metavar="PERCENT",
+        help="Interface altindaki max-reserved-bandwidth degeri "
+             f"(default {IOS_DEFAULT_MAX_RESERVED:g}). Interface'te 100'e "
+             "cektiysen burada da 100 ver ki gereksiz uyari cikmasin.",
+    )
 
     args = parser.parse_args()
 
@@ -237,6 +306,7 @@ def main():
         video_sessions=args.video_sessions,
         critical_kbps=args.critical_kbps,
         compressed_rtp=args.crtp,
+        max_reserved_percent=args.max_reserved_bandwidth,
     )
 
     print(plan.report())
