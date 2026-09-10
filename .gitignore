@@ -1,0 +1,7 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Sanal ortamlar
+.venv/
+venv/

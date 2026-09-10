@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""
+qos_bandwidth_planner.py
+
+Cisco QoS (LLQ / CBWFQ) bant genisligi yuzdelerini KEYFI vermek yerine,
+gercek codec + Layer-2 overhead formulleriyle hesaplayan bir arac.
+
+Neden var:
+    "voice icin %50, video icin %30 verelim" gibi tahmini sayilar yerine,
+    kac esanli cagri olacagini / hangi codec kullanilacagini / hangi L2
+    tasiyiciyi kullandigini soyleyince gercek kbps ihtiyacini hesaplar,
+    Cisco'nun onerdigi guardrail'leri (LLQ toplami linkin %33'unu gecmesin,
+    class-default icin en az %25 pay birak) otomatik kontrol eder ve
+    dogrudan router'a yapistirilabilecek bir policy-map uretir.
+
+Kullanim:
+    python3 qos_bandwidth_planner.py --help
+    python3 qos_bandwidth_planner.py                      (parametre vermeden calistir -> ornek senaryo)
+    python3 qos_bandwidth_planner.py --link-kbps 10000 --calls 15 --codec g711 --crtp
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+import argparse
+import math
+import sys
+
+
+# ---------------------------------------------------------------------------
+# 1) Codec tanimlari
+#    payload_bytes: paket basina tasinan ses verisi, interval'e gore hesaplanir
+#    interval_ms  : paketleme araligi (cogu codec 20ms kullanir)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Codec:
+    name: str
+    bitrate_kbps: float   # ham codec hizi (orn. G.711 = 64 kbps)
+    interval_ms: int      # paketleme araligi
+
+    @property
+    def payload_bytes(self) -> float:
+        return (self.bitrate_kbps * 1000 / 8) * (self.interval_ms / 1000)
+
+
+CODECS = {
+    "g711": Codec("G.711", 64.0, 20),
+    "g729": Codec("G.729", 8.0, 20),
+    "g722": Codec("G.722", 64.0, 20),
+    "g723": Codec("G.723.1", 6.3, 30),
+}
+
+# Layer-2 header/overhead (byte) -- tasiyiciya gore degisir
+L2_OVERHEAD = {
+    "ethernet": 18,     # 14 header + 4 FCS (VLAN yok)
+    "dot1q": 22,        # 802.1Q etiketli Ethernet
+    "mlppp": 6,
+    "ppp": 6,
+    "hdlc": 4,
+    "frame-relay": 4,
+}
+
+RTP_UDP_IP_HEADER = 40   # RTP(12)+UDP(8)+IP(20), sikistirilmamis
+CRTP_HEADER = 4          # cRTP ile sikistirilmis (yaklasik, IOS/linke gore 2-4 byte degisebilir)
+
+# Cisco Enterprise QoS SRND onerisi: toplam LLQ (priority) linkin %33'unu gecmemeli
+LLQ_MAX_PERCENT = 33.0
+# class-default / scavenger icin onerilen minimum pay
+CLASS_DEFAULT_MIN_PERCENT = 25.0
+
+# IOS'ta interface altindaki "max-reserved-bandwidth" komutu, CBWFQ+LLQ'nun
+# rezerve edebilecegi toplam payi sinirlar. Default %75'tir; kalan %25 kontrol
+# duzlemi (routing protokolleri, L2 keepalive) icin ayrilir. Toplam bu siniri
+# asarsa policy interface'e HIC uygulanmaz.
+IOS_DEFAULT_MAX_RESERVED = 75.0
+
+# IOS'ta "bandwidth percent" / "priority percent" parser araligi 1-100'dur;
+# 0 kabul edilmez. Asagidaki iki sabit uretilen config'i bu araliga zorlar.
+IOS_MIN_PERCENT = 1
+IOS_MAX_PERCENT = 100
+
+
+def to_ios_percent(percent: float) -> int:
+    """Hesaplanan yuzdeyi IOS'un kabul ettigi tam sayiya cevirir.
+
+    Iki tuzagi kapatir:
+      1. Python'un round() fonksiyonu bankaci yuvarlamasi yapar (round(2.5) == 2),
+         yani QoS payinda beklenmedik sonuc verir. Burada yarim yukari yuvarlanir.
+      2. %1'in altindaki gercek bir pay 0'a dusup "bandwidth percent 0" uretirdi.
+         Bu satiri IOS reddeder, o yuzden en az 1'e cekilir.
+
+    Trafigi olmayan (pay == 0) bir class da ayni kurala tabidir: policy-map
+    sablonunda kaldigi icin en dusuk gecerli deger olan 1 ile yazilir.
+    """
+    rounded = math.floor(percent + 0.5)
+    return max(IOS_MIN_PERCENT, min(IOS_MAX_PERCENT, rounded))
+
+
+def per_call_kbps(codec_key: str, l2_type: str, compressed_rtp: bool = False) -> float:
+    """Tek bir cagrinin WAN uzerinde tuttugu gercek bant genisligini (kbps) hesaplar."""
+    codec = CODECS[codec_key]
+    l2_overhead = L2_OVERHEAD[l2_type]
+    header = CRTP_HEADER if compressed_rtp else RTP_UDP_IP_HEADER
+
+    total_packet_bytes = codec.payload_bytes + header + l2_overhead
+    packets_per_second = 1000 / codec.interval_ms
+    bandwidth_bps = total_packet_bytes * 8 * packets_per_second
+    return bandwidth_bps / 1000
+
+
+@dataclass
+class QoSPlan:
+    link_kbps: float
+    voice_kbps: float
+    video_kbps: float
+    critical_kbps: float
+    # Interface altinda "max-reserved-bandwidth" degistirilmisse buraya yaz.
+    max_reserved_percent: float = IOS_DEFAULT_MAX_RESERVED
+
+    def raw_percent(self, kbps: float) -> float:
+        """Rapor icin yuvarlanmamis yuzde -- IOS donusumu bu deger uzerinden yapilir."""
+        return kbps / self.link_kbps * 100
+
+    @property
+    def voice_percent(self) -> float:
+        return round(self.raw_percent(self.voice_kbps), 1)
+
+    @property
+    def video_percent(self) -> float:
+        return round(self.raw_percent(self.video_kbps), 1)
+
+    @property
+    def critical_percent(self) -> float:
+        return round(self.raw_percent(self.critical_kbps), 1)
+
+    def ios_percents(self) -> dict[str, int]:
+        """Policy-map'e yazilacak tam sayi paylari (class adi -> yuzde)."""
+        return {
+            "VOICE": to_ios_percent(self.raw_percent(self.voice_kbps)),
+            "VIDEO": to_ios_percent(self.raw_percent(self.video_kbps)),
+            "CRITICAL-DATA": to_ios_percent(self.raw_percent(self.critical_kbps)),
+        }
+
+    @property
+    def reserved_percent(self) -> int:
+        """IOS'un max-reserved-bandwidth'e karsi saydigi toplam.
+
+        Bilerek ham yuzdeler degil, policy-map'e YAZILAN tam sayilar toplanir --
+        IOS de config'deki degerlere bakar. Yuvarlama ve trafigi olmayan
+        class'lar icin uygulanan %1 alt siniri bu toplami ham degerin uzerine
+        cikarabilir, ki asilma tam olarak orada yasanir.
+        """
+        return sum(self.ios_percents().values())
+
+    @property
+    def idle_classes(self) -> list[str]:
+        """Trafigi olmadigi halde policy-map'te %1 tutan class'lar."""
+        traffic = {
+            "VOICE": self.voice_kbps,
+            "VIDEO": self.video_kbps,
+            "CRITICAL-DATA": self.critical_kbps,
+        }
+        return [name for name, kbps in traffic.items() if kbps <= 0]
+
+    @property
+    def class_default_percent(self) -> float:
+        used = self.voice_percent + self.video_percent + self.critical_percent
+        return round(100 - used, 1)
+
+    def warnings(self) -> list[str]:
+        msgs = []
+        if self.voice_percent > LLQ_MAX_PERCENT:
+            msgs.append(
+                f"VOICE (LLQ) payi %{self.voice_percent} -- Cisco'nun onerdigi "
+                f"%{LLQ_MAX_PERCENT} sinirini asiyor. cRTP kullanmayi, CAC ile esanli "
+                f"cagri sayisini sinirlamayi ya da linki buyutmeyi degerlendir."
+            )
+        if self.class_default_percent < CLASS_DEFAULT_MIN_PERCENT:
+            msgs.append(
+                f"class-default payi %{self.class_default_percent} -- onerilen "
+                f"minimum %{CLASS_DEFAULT_MIN_PERCENT}'in altinda. Best-effort/"
+                f"scavenger trafik tamamen aclikta kalabilir."
+            )
+        if self.reserved_percent > self.max_reserved_percent:
+            msg = (
+                f"Policy-map toplam rezervasyonu %{self.reserved_percent} -- interface "
+                f"altindaki max-reserved-bandwidth siniri %{self.max_reserved_percent:g}'i "
+                f"asiyor. Bu bir performans uyarisi DEGIL: IOS policy'yi 'service-policy "
+                f"output' ile uygularken 'requested bandwidth ... available only ...' "
+                f"hatasi verip reddeder. Ya sinif paylarini dusur ya da interface altinda "
+                f"'max-reserved-bandwidth 100' kullan (o durumda kontrol duzlemi/L2 "
+                f"keepalive icin payi kendin birakmalisin)."
+            )
+            idle = self.idle_classes
+            if idle:
+                msg += (
+                    f" Not: trafigi olmayan {', '.join(idle)} class(lar)i, IOS %0'i kabul "
+                    f"etmedigi icin %1 ile yaziliyor ve bu toplama dahil."
+                )
+            msgs.append(msg)
+
+        if self.class_default_percent < 0:
+            msgs.append(
+                "TOPLAM %100'U ASIYOR -- bu plan link kapasitesinin uzerinde talep "
+                "ediyor, oldugu gibi devreye alinamaz."
+            )
+        return msgs
+
+    def report(self) -> str:
+        lines = [
+            f"Link kapasitesi        : {self.link_kbps:.0f} kbps",
+            f"VOICE (LLQ)             : {self.voice_kbps:.1f} kbps  (%{self.voice_percent})",
+            f"VIDEO (CBWFQ)           : {self.video_kbps:.1f} kbps  (%{self.video_percent})",
+            f"CRITICAL-DATA (CBWFQ)   : {self.critical_kbps:.1f} kbps  (%{self.critical_percent})",
+            f"class-default (kalan)   : %{self.class_default_percent}",
+            f"Policy-map rezervasyonu : %{self.reserved_percent}"
+            f"  (max-reserved-bandwidth %{self.max_reserved_percent:g})",
+        ]
+        warn = self.warnings()
+        if warn:
+            lines.append("")
+            lines.append("UYARILAR:")
+            for w in warn:
+                lines.append(f"  - {w}")
+        return "\n".join(lines)
+
+    def to_policy_map(self, name: str = "WAN-EDGE-QOS") -> str:
+        """Hesaplanan yuzdelerle dogrudan router'a yapistirilabilir policy-map uretir.
+
+        Class listesi sabittir -- trafigi olmayan class da sablonda kalir, boylece
+        cikti her zaman ayni iskeleti verir. Yuzdeler to_ios_percent() uzerinden
+        gectigi icin hicbir satir "percent 0" uretmez (IOS bunu reddeder);
+        karsiligi olmayan bir class en dusuk deger olan 1 ile yazilir.
+        """
+        pct = self.ios_percents()
+        return (
+            f"policy-map {name}\n"
+            f" class VOICE\n"
+            f"  priority percent {pct['VOICE']}\n"
+            f" class VIDEO\n"
+            f"  bandwidth percent {pct['VIDEO']}\n"
+            f"  random-detect dscp-based\n"
+            f" class CRITICAL-DATA\n"
+            f"  bandwidth percent {pct['CRITICAL-DATA']}\n"
+            f"  random-detect dscp-based\n"
+            f" class class-default\n"
+            f"  fair-queue\n"
+            f"  random-detect\n"
+        )
+
+
+def build_plan(
+    link_kbps: float,
+    codec_key: str,
+    concurrent_calls: int,
+    l2_type: str,
+    video_kbps_per_session: float,
+    video_sessions: int,
+    critical_kbps: float,
+    compressed_rtp: bool = False,
+    max_reserved_percent: float = IOS_DEFAULT_MAX_RESERVED,
+) -> QoSPlan:
+    call_kbps = per_call_kbps(codec_key, l2_type, compressed_rtp)
+    voice_total = call_kbps * concurrent_calls
+    video_total = video_kbps_per_session * video_sessions
+
+    return QoSPlan(
+        link_kbps=link_kbps,
+        voice_kbps=voice_total,
+        video_kbps=video_total,
+        critical_kbps=critical_kbps,
+        max_reserved_percent=max_reserved_percent,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Cisco QoS (LLQ/CBWFQ) bant genisligi yuzdelerini hesaplar."
+    )
+    parser.add_argument("--link-kbps", type=float, required=True, help="WAN link kapasitesi (kbps)")
+    parser.add_argument("--codec", choices=CODECS.keys(), default="g711")
+    parser.add_argument("--calls", type=int, required=True, help="Esanli maksimum cagri sayisi")
+    parser.add_argument("--l2", choices=L2_OVERHEAD.keys(), default="ethernet")
+    parser.add_argument("--crtp", action="store_true", help="cRTP (sikistirilmis RTP) kullanimi")
+    parser.add_argument("--video-kbps-per-session", type=float, default=0)
+    parser.add_argument("--video-sessions", type=int, default=0)
+    parser.add_argument("--critical-kbps", type=float, default=0)
+    parser.add_argument("--policy-name", default="WAN-EDGE-QOS")
+    parser.add_argument(
+        "--max-reserved-bandwidth",
+        type=float,
+        default=IOS_DEFAULT_MAX_RESERVED,
+        metavar="PERCENT",
+        help="Interface altindaki max-reserved-bandwidth degeri "
+             f"(default {IOS_DEFAULT_MAX_RESERVED:g}). Interface'te 100'e "
+             "cektiysen burada da 100 ver ki gereksiz uyari cikmasin.",
+    )
+
+    args = parser.parse_args()
+
+    plan = build_plan(
+        link_kbps=args.link_kbps,
+        codec_key=args.codec,
+        concurrent_calls=args.calls,
+        l2_type=args.l2,
+        video_kbps_per_session=args.video_kbps_per_session,
+        video_sessions=args.video_sessions,
+        critical_kbps=args.critical_kbps,
+        compressed_rtp=args.crtp,
+        max_reserved_percent=args.max_reserved_bandwidth,
+    )
+
+    print(plan.report())
+    print()
+    print("--- Onerilen policy-map ---")
+    print(plan.to_policy_map(args.policy_name))
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        main()
+    else:
+        # Parametre verilmeden calistirilirsa ornek bir senaryo gosterir:
+        # 10 Mbps WAN, G.711 ile 10 esanli cagri, 3 video oturumu, 1 Mbps kritik uygulama
+        example = build_plan(
+            link_kbps=10000,
+            codec_key="g711",
+            concurrent_calls=10,
+            l2_type="ethernet",
+            video_kbps_per_session=1000,
+            video_sessions=3,
+            critical_kbps=1000,
+        )
+        print("Parametre verilmedi -- ornek senaryo calistiriliyor:")
+        print()
+        print(example.report())
+        print()
+        print("--- Onerilen policy-map ---")
+        print(example.to_policy_map())
