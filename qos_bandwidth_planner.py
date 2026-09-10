@@ -22,6 +22,7 @@ Kullanim:
 from __future__ import annotations
 from dataclasses import dataclass
 import argparse
+import math
 import sys
 
 
@@ -66,6 +67,27 @@ LLQ_MAX_PERCENT = 33.0
 # class-default / scavenger icin onerilen minimum pay
 CLASS_DEFAULT_MIN_PERCENT = 25.0
 
+# IOS'ta "bandwidth percent" / "priority percent" parser araligi 1-100'dur;
+# 0 kabul edilmez. Asagidaki iki sabit uretilen config'i bu araliga zorlar.
+IOS_MIN_PERCENT = 1
+IOS_MAX_PERCENT = 100
+
+
+def to_ios_percent(percent: float) -> int:
+    """Hesaplanan yuzdeyi IOS'un kabul ettigi tam sayiya cevirir.
+
+    Iki tuzagi kapatir:
+      1. Python'un round() fonksiyonu bankaci yuvarlamasi yapar (round(2.5) == 2),
+         yani QoS payinda beklenmedik sonuc verir. Burada yarim yukari yuvarlanir.
+      2. %1'in altindaki gercek bir pay 0'a dusup "bandwidth percent 0" uretirdi.
+         Bu satiri IOS reddeder, o yuzden en az 1'e cekilir.
+
+    Trafigi olmayan (pay == 0) bir class da ayni kurala tabidir: policy-map
+    sablonunda kaldigi icin en dusuk gecerli deger olan 1 ile yazilir.
+    """
+    rounded = math.floor(percent + 0.5)
+    return max(IOS_MIN_PERCENT, min(IOS_MAX_PERCENT, rounded))
+
 
 def per_call_kbps(codec_key: str, l2_type: str, compressed_rtp: bool = False) -> float:
     """Tek bir cagrinin WAN uzerinde tuttugu gercek bant genisligini (kbps) hesaplar."""
@@ -86,17 +108,21 @@ class QoSPlan:
     video_kbps: float
     critical_kbps: float
 
+    def raw_percent(self, kbps: float) -> float:
+        """Rapor icin yuvarlanmamis yuzde -- IOS donusumu bu deger uzerinden yapilir."""
+        return kbps / self.link_kbps * 100
+
     @property
     def voice_percent(self) -> float:
-        return round(self.voice_kbps / self.link_kbps * 100, 1)
+        return round(self.raw_percent(self.voice_kbps), 1)
 
     @property
     def video_percent(self) -> float:
-        return round(self.video_kbps / self.link_kbps * 100, 1)
+        return round(self.raw_percent(self.video_kbps), 1)
 
     @property
     def critical_percent(self) -> float:
-        return round(self.critical_kbps / self.link_kbps * 100, 1)
+        return round(self.raw_percent(self.critical_kbps), 1)
 
     @property
     def class_default_percent(self) -> float:
@@ -141,16 +167,22 @@ class QoSPlan:
         return "\n".join(lines)
 
     def to_policy_map(self, name: str = "WAN-EDGE-QOS") -> str:
-        """Hesaplanan yuzdelerle dogrudan router'a yapistirilabilir policy-map uretir."""
+        """Hesaplanan yuzdelerle dogrudan router'a yapistirilabilir policy-map uretir.
+
+        Class listesi sabittir -- trafigi olmayan class da sablonda kalir, boylece
+        cikti her zaman ayni iskeleti verir. Yuzdeler to_ios_percent() uzerinden
+        gectigi icin hicbir satir "percent 0" uretmez (IOS bunu reddeder);
+        karsiligi olmayan bir class en dusuk deger olan 1 ile yazilir.
+        """
         return (
             f"policy-map {name}\n"
             f" class VOICE\n"
-            f"  priority percent {round(self.voice_percent)}\n"
+            f"  priority percent {to_ios_percent(self.raw_percent(self.voice_kbps))}\n"
             f" class VIDEO\n"
-            f"  bandwidth percent {round(self.video_percent)}\n"
+            f"  bandwidth percent {to_ios_percent(self.raw_percent(self.video_kbps))}\n"
             f"  random-detect dscp-based\n"
             f" class CRITICAL-DATA\n"
-            f"  bandwidth percent {round(self.critical_percent)}\n"
+            f"  bandwidth percent {to_ios_percent(self.raw_percent(self.critical_kbps))}\n"
             f"  random-detect dscp-based\n"
             f" class class-default\n"
             f"  fair-queue\n"
